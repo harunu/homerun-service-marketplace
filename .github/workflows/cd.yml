@@ -1,0 +1,237 @@
+name: CD Pipeline
+
+on:
+  workflow_run:
+    workflows: ["CI Pipeline"]
+    types:
+      - completed
+    branches:
+      - main
+
+jobs:
+  build-and-publish:
+    name: Build and Publish
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+
+    steps:
+    - uses: actions/checkout@v2
+    
+    - name: Azure Login
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+        
+    # First check if SQL server exists and get its FQDN for the connection strings
+    - name: Get SQL Server Info
+      run: |
+        # Create resource group if it doesn't exist
+        if ! az group show --name service-marketplace-rg &>/dev/null; then
+          echo "Creating resource group service-marketplace-rg"
+          az group create --name service-marketplace-rg --location westeurope
+        else
+          echo "Resource group service-marketplace-rg already exists"
+        fi
+        
+        # Check if SQL server exists
+        if ! az sql server show --name sqlserver-marketplace --resource-group service-marketplace-rg &>/dev/null; then
+          echo "Creating Azure SQL Server"
+          az sql server create \
+            --name sqlserver-marketplace \
+            --resource-group service-marketplace-rg \
+            --location westeurope \
+            --admin-user sqlAdmin \
+            --admin-password "YourStrong@Passw0rd" \
+            --enable-public-network true
+          
+          # Allow Azure services access
+          az sql server firewall-rule create \
+            --name AllowAzureServices \
+            --resource-group service-marketplace-rg \
+            --server sqlserver-marketplace \
+            --start-ip-address 0.0.0.0 \
+            --end-ip-address 0.0.0.0
+        else
+          echo "SQL Server already exists"
+        fi
+        
+        # Get SQL Server FQDN for connection string
+        SQL_FQDN=$(az sql server show \
+          --name sqlserver-marketplace \
+          --resource-group service-marketplace-rg \
+          --query fullyQualifiedDomainName \
+          --output tsv)
+          
+        echo "SQL Server FQDN: $SQL_FQDN"
+        echo "SQL_FQDN=$SQL_FQDN" >> $GITHUB_ENV
+    
+    # Update appsettings.json files BEFORE building the Docker image
+    - name: Update Service Configs
+      run: |
+        cat <<EOF > src/RatingService/RatingService.Api/appsettings.json
+        {
+          "ConnectionStrings": {
+            "RatingDb": "Server=${{ env.SQL_FQDN }};Database=RatingDb;User Id=sqlAdmin;Password=YourStrong@Passw0rd;Encrypt=True;TrustServerCertificate=False;Connection Timeout=60;ConnectRetryCount=10;ConnectRetryInterval=10"
+          },
+          "ASPNETCORE_URLS": "http://+:8080"
+        }
+        EOF
+        cat <<EOF > src/NotificationService/NotificationService.Api/appsettings.json
+        {
+          "ConnectionStrings": {
+            "NotificationDb": "Server=${{ env.SQL_FQDN }};Database=NotificationDb;User Id=sqlAdmin;Password=YourStrong@Passw0rd;Encrypt=True;TrustServerCertificate=False;Connection Timeout=60;ConnectRetryCount=10;ConnectRetryInterval=10"
+          },
+          "ASPNETCORE_URLS": "http://+:8080"
+        }
+        EOF
+        
+        # Display the connection strings for debugging (mask password)
+        echo "Rating DB Connection String: Server=${{ env.SQL_FQDN }};Database=RatingDb;User Id=sqlAdmin;Password=****;Encrypt=True;TrustServerCertificate=False;Connection Timeout=60;ConnectRetryCount=10;ConnectRetryInterval=10"
+        echo "Notification DB Connection String: Server=${{ env.SQL_FQDN }};Database=NotificationDb;User Id=sqlAdmin;Password=****;Encrypt=True;TrustServerCertificate=False;Connection Timeout=60;ConnectRetryCount=10;ConnectRetryInterval=10"
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v1
+
+    - name: Login to DockerHub
+      uses: docker/login-action@v2
+      with:
+        username: ${{ secrets.DOCKERHUB_USERNAME }}
+        password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+    # Now build and push the Docker image, which will include the updated appsettings.json files
+    - name: Build and push Services
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: Dockerfile
+        push: true
+        tags: ${{ secrets.DOCKERHUB_USERNAME }}/service-marketplace-services:latest
+
+  deploy:
+    name: Deploy to Azure
+    needs: build-and-publish
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v2
+
+    - name: Azure Login
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+        
+    # Create a Container Apps Environment if it doesn't exist
+    - name: Check Container Apps Environment
+      run: |
+        if ! az containerapp env show --name managedEnvironment-servicemarketpl-9d5c --resource-group service-marketplace-rg &>/dev/null; then
+          echo "Creating Container Apps Environment"
+          az containerapp env create \
+            --name managedEnvironment-servicemarketpl-9d5c \
+            --resource-group service-marketplace-rg \
+            --location westeurope
+        else
+          echo "Container Apps Environment already exists"
+        fi
+
+    # Create the databases if they don't exist
+    - name: Configure Azure SQL Databases
+      run: |
+        # Get SQL Server FQDN
+        SQL_FQDN=$(az sql server show \
+          --name sqlserver-marketplace \
+          --resource-group service-marketplace-rg \
+          --query fullyQualifiedDomainName \
+          --output tsv)
+          
+        echo "SQL Server FQDN: $SQL_FQDN"
+        echo "SQL_FQDN=$SQL_FQDN" >> $GITHUB_ENV
+        
+        # Create Rating database if it doesn't exist
+        if ! az sql db show --name RatingDb --server sqlserver-marketplace --resource-group service-marketplace-rg &>/dev/null; then
+          echo "Creating RatingDb database"
+          az sql db create \
+            --name RatingDb \
+            --server sqlserver-marketplace \
+            --resource-group service-marketplace-rg \
+            --service-objective Basic
+        else
+          echo "RatingDb database already exists"
+        fi
+        
+        # Create Notification database if it doesn't exist
+        if ! az sql db show --name NotificationDb --server sqlserver-marketplace --resource-group service-marketplace-rg &>/dev/null; then
+          echo "Creating NotificationDb database"
+          az sql db create \
+            --name NotificationDb \
+            --server sqlserver-marketplace \
+            --resource-group service-marketplace-rg \
+            --service-objective Basic
+        else
+          echo "NotificationDb database already exists"
+        fi
+
+    # Wait for databases to be fully ready
+    - name: Wait for Databases
+      run: |
+        echo "Waiting for databases to be fully provisioned..."
+        sleep 30
+
+    # Add Container Apps outbound IP to SQL firewall
+    - name: Add Container App IP to SQL Firewall
+      run: |
+       OUTBOUND_IPS=$(az containerapp env show \
+        --name managedEnvironment-servicemarketpl-9d5c \
+        --resource-group service-marketplace-rg \
+        --query properties.staticIp \
+        --output tsv)
+      
+         echo "Container Apps Environment outbound IP: $OUTBOUND_IPS"
+    
+         az sql server firewall-rule create \
+         --name ContainerAppsOutbound \
+         --resource-group service-marketplace-rg \
+         --server sqlserver-marketplace \
+         --start-ip-address $OUTBOUND_IPS \
+         --end-ip-address $OUTBOUND_IPS
+
+    # Deploy the container app with the correct environment variables
+    - name: Deploy Application
+      run: |
+        echo "Deploying application with connection to Azure SQL"
+        
+        # Create/update the container app
+        az containerapp up \
+          --name service-marketplace \
+          --resource-group service-marketplace-rg \
+          --environment managedEnvironment-servicemarketpl-9d5c \
+          --image ${{ secrets.DOCKERHUB_USERNAME }}/service-marketplace-services:latest \
+          --ingress external \
+          --target-port 8080 \
+          --env-vars \
+            "ConnectionStrings__RatingDb=Server=${{ env.SQL_FQDN }};Database=RatingDb;User Id=sqlAdmin;Password=YourStrong@Passw0rd;Encrypt=True;TrustServerCertificate=True;Connection Timeout=60;ConnectRetryCount=10;ConnectRetryInterval=10" \
+            "ConnectionStrings__NotificationDb=Server=${{ env.SQL_FQDN }};Database=NotificationDb;User Id=sqlAdmin;Password=YourStrong@Passw0rd;Encrypt=True;TrustServerCertificate=True;Connection Timeout=60;ConnectRetryCount=10;ConnectRetryInterval=10"
+        
+        # Display the connection strings for verification (mask password)
+        echo "Container app environment variables set with connection strings:"
+        echo "Rating DB Connection String: Server=${{ env.SQL_FQDN }};Database=RatingDb;User Id=sqlAdmin;Password=****;Encrypt=True;TrustServerCertificate=False;Connection Timeout=60;ConnectRetryCount=10;ConnectRetryInterval=10"
+        echo "Notification DB Connection String: Server=${{ env.SQL_FQDN }};Database=NotificationDb;User Id=sqlAdmin;Password=****;Encrypt=True;TrustServerCertificate=False;Connection Timeout=60;ConnectRetryCount=10;ConnectRetryInterval=10"
+
+        # Update the scale settings and add RabbitMQ configuration 
+        echo "Configuring scale settings and RabbitMQ environment"
+        az containerapp update \
+        --name service-marketplace \
+        --resource-group service-marketplace-rg \
+        --min-replicas 1 \
+        --max-replicas 3 \
+        --set-env-vars RabbitMQ__HostName=rabbitmq-broker.internal RabbitMQ__Port=5672 RabbitMQ__UserName=guest RabbitMQ__Password=guest RabbitMQ__VirtualHost=/ RabbitMQ__ExchangeName=notification_exchange RabbitMQ__QueueName=notification_queue RabbitMQ__RoutingKey=notifications.# ASPNETCORE_ENVIRONMENT=Development EnableSwagger=true
+
+    - name: Verify Deployment
+      run: |
+        echo "Verifying deployment..."
+        az containerapp show \
+          --name service-marketplace \
+          --resource-group service-marketplace-rg \
+          --query properties.configuration.ingress.fqdn
+          
+        echo "Deployment completed successfully!"
