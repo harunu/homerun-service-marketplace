@@ -1,0 +1,94 @@
+version: '3.8'
+
+services:
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:2019-latest
+    environment:
+      ACCEPT_EULA: Y
+      SA_PASSWORD: YourStrong@Passw0rd
+      MSSQL_TLS_ENFORCE: "0"  # Disables TLS enforcement to prevent SSL issues
+    ports:
+      - "1433:1433"
+    volumes:
+      - sqlserver-data:/var/opt/mssql
+    networks:
+      - servicemarketplace
+    healthcheck:
+      test: ["CMD", "/opt/mssql-tools18/bin/sqlcmd", "-S", "localhost", "-U", "sa", "-P", "YourStrong@Passw0rd", "-C", "-Q", "SELECT 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 50s
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    networks:
+      - servicemarketplace
+    healthcheck:
+      test: ["CMD", "rabbitmqctl", "status"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+
+  rating-service:
+    build:
+      context: ..  
+      dockerfile: Dockerfile
+      target: rating-final
+    ports:
+      - "5001:8080"
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Production
+      - ConnectionStrings__RatingDb=Server=sqlserver;Database=RatingDb;User Id=sa;Password=YourStrong@Passw0rd;Encrypt=False;TrustServerCertificate=True;
+      - RabbitMq__HostName=rabbitmq
+      - ASPNETCORE_URLS=http://+:8080
+    command: >
+      /bin/sh -c "dotnet RatingService.Api.dll"
+    depends_on:
+      sqlserver:
+        condition: service_healthy  
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - servicemarketplace
+    restart: on-failure
+
+  notification-service:
+    build:
+      context: ..  
+      dockerfile: Dockerfile
+      target: notification-final
+    ports:
+      - "5002:8080"
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Production
+      - ConnectionStrings__NotificationDb=Server=sqlserver;Database=NotificationDb;User Id=sa;Password=YourStrong@Passw0rd;Encrypt=False;TrustServerCertificate=True;
+      - RabbitMq__HostName=rabbitmq
+      - ASPNETCORE_URLS=http://+:8080
+    command: >
+        /bin/sh -c "dotnet NotificationService.Api.dll"
+    depends_on:
+      sqlserver:
+        condition: service_healthy  
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - servicemarketplace
+    restart: on-failure
+
+networks:
+  servicemarketplace:
+    driver: bridge
+
+volumes:
+  sqlserver-data:
+  rabbitmq-data:
